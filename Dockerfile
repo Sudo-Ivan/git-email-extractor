@@ -1,7 +1,7 @@
 FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
-COPY main.go go.mod go.sum ./
+COPY main.go go.mod ./
 RUN go build -o git-email-extractor
 
 FROM alpine:latest
