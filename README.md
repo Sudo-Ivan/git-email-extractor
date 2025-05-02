@@ -1,6 +1,6 @@
 # Git Email Extractor
 
-A tool to extract email addresses from any git repository. Requires Git on your system or use Docker.
+A tool to extract email addresses from any git repository. Only dependency is Git on your system. It can process multiple repositories in parallel.
 
 You can find built binaries for mostly every platform in the [Releases](https://github.com/Sudo-Ivan/Git-Email-Extractor/releases) page. Binaries are built using Github Actions.
 
@@ -25,4 +25,10 @@ docker-compose run --rm git-email-extractor -c https://github.com/user/repo
 # Extract emails and save to output file
 docker-compose run --rm git-email-extractor -c -f json -o /output/results.json https://github.com/user/repo
 ```
+
+## FAQ
+
+**Why Git instead of API?**
+
+Requiring Git makes it easier to support all types of git platforms, including self-hosted ones. APIs also can change and have rate limits.
 
