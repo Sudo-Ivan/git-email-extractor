@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Sudo-Ivan
+// Licensed under the MIT License
+
 package main
 
 import (
