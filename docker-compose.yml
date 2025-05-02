@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  git-email-extractor:
+    image: ghcr.io/sudo-ivan/git-email-extractor:latest
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    volumes:
+      - ./output:/output
+    environment:
+      - TZ=UTC 
