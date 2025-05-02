@@ -16,6 +16,7 @@ jobs:
 
       - name: Run Gosec
         uses: securego/gosec@60279264beb3f4ca2b288d39b84e930747009a8f
+        continue-on-error: true
         with:
           args: -fmt=sarif -out=results.sarif ./...
 
