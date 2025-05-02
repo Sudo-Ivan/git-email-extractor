@@ -2,6 +2,8 @@
 
 A tool to extract email addresses from any git repository. Requires Git on your system or use Docker.
 
+You can find built binaries for mostly every platform in the [Releases](https://github.com/Sudo-Ivan/Git-Email-Extractor/releases) page. Binaries are built using Github Actions.
+
 ## Usage
 
 ### Using Go
