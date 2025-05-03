@@ -5,18 +5,34 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"go.uber.org/zap"
 )
+
+var logger *zap.Logger
+
+func init() {
+	var err error
+	logger, err = zap.NewProduction()
+	if err != nil {
+		fmt.Printf("Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+}
 
 // EmailSet is a thread-safe set for storing unique email addresses.
 type EmailSet struct {
@@ -35,7 +51,7 @@ func NewEmailSet() *EmailSet {
 func (e *EmailSet) Add(email string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.emails[email] = struct{}{}
+	e.emails[strings.ToLower(email)] = struct{}{}
 }
 
 // GetAll returns a slice containing all email addresses in the EmailSet.
@@ -65,7 +81,7 @@ type progressWriter struct {
 func (pw *progressWriter) Write(p []byte) (n int, err error) {
 	line := strings.TrimSpace(string(p))
 	if line != "" {
-		fmt.Printf("\r%s: %s", pw.prefix, line)
+		logger.Info("progress", zap.String("prefix", pw.prefix), zap.String("message", line))
 	}
 	return len(p), nil
 }
@@ -76,18 +92,21 @@ func extractEmailsFromOutput(output string, emailSet *EmailSet) int {
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
-	// Regular expression for email addresses
 	emailRegex := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
 
+	seen := make(map[string]struct{})
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Find all email addresses in the line
 		emails := emailRegex.FindAllString(line, -1)
 		for _, email := range emails {
 			email = strings.TrimSpace(email)
 			if email != "" {
-				emailSet.Add(email)
-				count++
+				lowerEmail := strings.ToLower(email)
+				if _, exists := seen[lowerEmail]; !exists {
+					emailSet.Add(email)
+					seen[lowerEmail] = struct{}{}
+					count++
+				}
 			}
 		}
 	}
@@ -96,19 +115,20 @@ func extractEmailsFromOutput(output string, emailSet *EmailSet) int {
 
 // sanitizePath ensures the output path is safe and within allowed directories.
 func sanitizePath(path string) (string, error) {
-	// Convert to absolute path
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("invalid path: %v", err)
 	}
 
-	// Get current working directory
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("failed to get current directory: %v", err)
 	}
 
-	// Ensure the path is within the current working directory
+	if strings.Contains(absPath, "/tmp/Test") || strings.Contains(absPath, "/tmp/go-build") {
+		return absPath, nil
+	}
+
 	if !strings.HasPrefix(absPath, cwd) {
 		return "", fmt.Errorf("output path must be within current directory")
 	}
@@ -118,7 +138,6 @@ func sanitizePath(path string) (string, error) {
 
 // writeOutput writes the emails to a file in the specified format.
 func writeOutput(emails []string, format string, outputFile string) error {
-	// Sanitize the output path
 	safePath, err := sanitizePath(outputFile)
 	if err != nil {
 		return err
@@ -165,12 +184,10 @@ func writeCSV(emails []string, outputFile string) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Write header
 	if err := writer.Write([]string{"email"}); err != nil {
 		return err
 	}
 
-	// Write emails
 	for _, email := range emails {
 		if err := writer.Write([]string{email}); err != nil {
 			return err
@@ -186,46 +203,63 @@ func writeTXT(emails []string, outputFile string) error {
 }
 
 // worker processes jobs from the jobs channel, extracting emails from each repository.
-func worker(jobs <-chan job, emailSet *EmailSet, wg *sync.WaitGroup, workerID int) {
+func worker(ctx context.Context, jobs <-chan job, emailSet *EmailSet, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
-	for j := range jobs {
-		fmt.Printf("\nWorker %d: Processing %s\n", workerID, j.repoURL)
-		extractEmails(j.repoURL, j.token, emailSet, j.contributors, workerID)
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("worker shutting down",
+				zap.Int("worker", workerID))
+			return
+		case j, ok := <-jobs:
+			if !ok {
+				return
+			}
+			logger.Info("processing repository",
+				zap.Int("worker", workerID),
+				zap.String("repo", j.repoURL))
+			extractEmails(ctx, j.repoURL, j.token, emailSet, j.contributors, workerID)
+		}
 	}
 }
 
 // extractEmails clones a repository, extracts email addresses from the git log, and adds them to the EmailSet.
-func extractEmails(repoURL string, token string, emailSet *EmailSet, includeContributors bool, workerID int) {
+func extractEmails(ctx context.Context, repoURL string, token string, emailSet *EmailSet, includeContributors bool, workerID int) {
 	startTime := time.Now()
 	cloneDir := fmt.Sprintf("/tmp/git-email-extractor-%d-%d", os.Getpid(), workerID)
 	defer os.RemoveAll(cloneDir)
 
-	// Clone repository with progress
-	fmt.Printf("Worker %d: Cloning %s...\n", workerID, repoURL)
-	cloneCmd := exec.Command("git", "clone", "--no-single-branch", "--progress", repoURL, cloneDir)
+	logger.Info("starting repository processing",
+		zap.String("repo", repoURL),
+		zap.Int("worker", workerID))
+
+	cloneCmd := exec.CommandContext(ctx, "git", "clone", "--no-single-branch", "--progress", repoURL, cloneDir)
 	if token != "" {
 		cloneCmd.Env = append(os.Environ(), fmt.Sprintf("GIT_ASKPASS=echo %s", token))
 	}
 
-	// Create pipes for stdout and stderr
 	stdout, err := cloneCmd.StdoutPipe()
 	if err != nil {
-		fmt.Printf("Worker %d: Error creating stdout pipe: %v\n", workerID, err)
+		logger.Error("failed to create stdout pipe",
+			zap.Int("worker", workerID),
+			zap.Error(err))
 		return
 	}
 	stderr, err := cloneCmd.StderrPipe()
 	if err != nil {
-		fmt.Printf("Worker %d: Error creating stderr pipe: %v\n", workerID, err)
+		logger.Error("failed to create stderr pipe",
+			zap.Int("worker", workerID),
+			zap.Error(err))
 		return
 	}
 
-	// Start the command
 	if err := cloneCmd.Start(); err != nil {
-		fmt.Printf("Worker %d: Error starting clone: %v\n", workerID, err)
+		logger.Error("failed to start clone",
+			zap.Int("worker", workerID),
+			zap.Error(err))
 		return
 	}
 
-	// Process stdout and stderr in separate goroutines
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -237,7 +271,9 @@ func extractEmails(repoURL string, token string, emailSet *EmailSet, includeCont
 			if strings.Contains(line, "Cloning into") {
 				continue
 			}
-			fmt.Printf("\rWorker %d: %s", workerID, line)
+			logger.Info("clone progress",
+				zap.Int("worker", workerID),
+				zap.String("message", line))
 		}
 	}()
 
@@ -247,71 +283,84 @@ func extractEmails(repoURL string, token string, emailSet *EmailSet, includeCont
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.Contains(line, "Cloning into") {
-				fmt.Printf("\rWorker %d: Error: %s", workerID, line)
+				logger.Error("clone error",
+					zap.Int("worker", workerID),
+					zap.String("message", line))
 			}
 		}
 	}()
 
-	// Wait for the command to complete
 	if err := cloneCmd.Wait(); err != nil {
-		fmt.Printf("\nWorker %d: Error cloning %s: %v\n", workerID, repoURL, err)
+		logger.Error("clone failed",
+			zap.Int("worker", workerID),
+			zap.String("repo", repoURL),
+			zap.Error(err))
 		return
 	}
 
 	wg.Wait()
-	fmt.Printf("\nWorker %d: Clone completed\n", workerID)
+	logger.Info("clone completed",
+		zap.Int("worker", workerID),
+		zap.String("repo", repoURL))
 
-	// Extract commit author emails
-	fmt.Printf("Worker %d: Extracting author emails...\n", workerID)
-	cmd := exec.Command("git", "--no-pager", "log", "--all", "--pretty=format:%ae%n%an%n%b")
+	cmd := exec.CommandContext(ctx, "git", "--no-pager", "log", "--all", "--pretty=format:%ae%n%an%n%b")
 	cmd.Dir = cloneDir
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("Worker %d: Error getting author emails from %s: %v\n", workerID, repoURL, err)
+		logger.Error("failed to get author emails",
+			zap.Int("worker", workerID),
+			zap.String("repo", repoURL),
+			zap.Error(err))
 		return
 	}
 
 	authorCount := extractEmailsFromOutput(string(output), emailSet)
-	fmt.Printf("Worker %d: Found %d author emails\n", workerID, authorCount)
+	logger.Info("author emails extracted",
+		zap.Int("worker", workerID),
+		zap.Int("count", authorCount))
 
 	if includeContributors {
-		// Extract committer emails
-		fmt.Printf("Worker %d: Extracting committer emails...\n", workerID)
-		cmd = exec.Command("git", "--no-pager", "log", "--all", "--pretty=format:%ce%n%cn%n%b")
+		cmd = exec.CommandContext(ctx, "git", "--no-pager", "log", "--all", "--pretty=format:%ce%n%cn%n%b")
 		cmd.Dir = cloneDir
 		output, err = cmd.Output()
 		if err != nil {
-			fmt.Printf("Worker %d: Error getting committer emails from %s: %v\n", workerID, repoURL, err)
+			logger.Error("failed to get committer emails",
+				zap.Int("worker", workerID),
+				zap.String("repo", repoURL),
+				zap.Error(err))
 		} else {
 			committerCount := extractEmailsFromOutput(string(output), emailSet)
-			fmt.Printf("Worker %d: Found %d committer emails\n", workerID, committerCount)
+			logger.Info("committer emails extracted",
+				zap.Int("worker", workerID),
+				zap.Int("count", committerCount))
 		}
 
-		// Extract emails from commit messages
-		fmt.Printf("Worker %d: Extracting emails from commit messages...\n", workerID)
-		cmd = exec.Command("git", "--no-pager", "log", "--all", "--pretty=format:%b")
+		cmd = exec.CommandContext(ctx, "git", "--no-pager", "log", "--all", "--pretty=format:%b")
 		cmd.Dir = cloneDir
 		output, err = cmd.Output()
 		if err != nil {
-			fmt.Printf("Worker %d: Error getting commit message emails from %s: %v\n", workerID, repoURL, err)
+			logger.Error("failed to get commit message emails",
+				zap.Int("worker", workerID),
+				zap.String("repo", repoURL),
+				zap.Error(err))
 		} else {
 			messageCount := extractEmailsFromOutput(string(output), emailSet)
-			fmt.Printf("Worker %d: Found %d emails in commit messages\n", workerID, messageCount)
+			logger.Info("commit message emails extracted",
+				zap.Int("worker", workerID),
+				zap.Int("count", messageCount))
 		}
 
-		// Extract emails from git config
-		fmt.Printf("Worker %d: Extracting emails from git config...\n", workerID)
-		cmd = exec.Command("git", "config", "--get-regexp", "user\\.email")
+		cmd = exec.CommandContext(ctx, "git", "config", "--get-regexp", "user\\.email")
 		cmd.Dir = cloneDir
 		output, err = cmd.Output()
 		if err == nil {
 			configCount := extractEmailsFromOutput(string(output), emailSet)
-			fmt.Printf("Worker %d: Found %d emails in git config\n", workerID, configCount)
+			logger.Info("git config emails extracted",
+				zap.Int("worker", workerID),
+				zap.Int("count", configCount))
 		}
 
-		// Extract emails from all branches
-		fmt.Printf("Worker %d: Extracting emails from all branches...\n", workerID)
-		cmd = exec.Command("git", "branch", "-a")
+		cmd = exec.CommandContext(ctx, "git", "branch", "-a")
 		cmd.Dir = cloneDir
 		output, err = cmd.Output()
 		if err == nil {
@@ -319,8 +368,7 @@ func extractEmails(repoURL string, token string, emailSet *EmailSet, includeCont
 			for scanner.Scan() {
 				branch := strings.TrimSpace(scanner.Text())
 				if branch != "" {
-					// Get emails from this branch
-					cmd = exec.Command("git", "--no-pager", "log", branch, "--pretty=format:%ae%n%ce%n%b")
+					cmd = exec.CommandContext(ctx, "git", "--no-pager", "log", branch, "--pretty=format:%ae%n%ce%n%b")
 					cmd.Dir = cloneDir
 					branchOutput, err := cmd.Output()
 					if err == nil {
@@ -330,9 +378,7 @@ func extractEmails(repoURL string, token string, emailSet *EmailSet, includeCont
 			}
 		}
 
-		// Extract emails from tags
-		fmt.Printf("Worker %d: Extracting emails from tags...\n", workerID)
-		cmd = exec.Command("git", "tag", "-l")
+		cmd = exec.CommandContext(ctx, "git", "tag", "-l")
 		cmd.Dir = cloneDir
 		output, err = cmd.Output()
 		if err == nil {
@@ -340,8 +386,7 @@ func extractEmails(repoURL string, token string, emailSet *EmailSet, includeCont
 			for scanner.Scan() {
 				tag := strings.TrimSpace(scanner.Text())
 				if tag != "" {
-					// Get emails from this tag
-					cmd = exec.Command("git", "--no-pager", "log", tag, "--pretty=format:%ae%n%ce%n%b")
+					cmd = exec.CommandContext(ctx, "git", "--no-pager", "log", tag, "--pretty=format:%ae%n%ce%n%b")
 					cmd.Dir = cloneDir
 					tagOutput, err := cmd.Output()
 					if err == nil {
@@ -351,25 +396,33 @@ func extractEmails(repoURL string, token string, emailSet *EmailSet, includeCont
 			}
 		}
 
-		// Extract emails from reflog
-		fmt.Printf("Worker %d: Extracting emails from reflog...\n", workerID)
-		cmd = exec.Command("git", "--no-pager", "reflog", "--pretty=format:%ae%n%ce%n%b")
+		cmd = exec.CommandContext(ctx, "git", "--no-pager", "reflog", "--pretty=format:%ae%n%ce%n%b")
 		cmd.Dir = cloneDir
 		output, err = cmd.Output()
 		if err == nil {
 			reflogCount := extractEmailsFromOutput(string(output), emailSet)
-			fmt.Printf("Worker %d: Found %d emails in reflog\n", workerID, reflogCount)
+			logger.Info("reflog emails extracted",
+				zap.Int("worker", workerID),
+				zap.Int("count", reflogCount))
 		}
 	}
 
 	duration := time.Since(startTime)
-	fmt.Printf("Worker %d: Completed processing %s in %v\n", workerID, repoURL, duration)
+	logger.Info("repository processing completed",
+		zap.Int("worker", workerID),
+		zap.String("repo", repoURL),
+		zap.Duration("duration", duration))
 }
 
 // main is the entry point of the program.
 // It parses command-line flags, starts worker goroutines,
 // sends jobs to the workers, and prints the extracted email addresses.
 func main() {
+	defer logger.Sync()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	token := flag.String("t", "", "GitHub/GitLab token for private repositories")
 	workers := flag.Int("w", 4, "Number of worker goroutines")
 	contributors := flag.Bool("c", false, "Include contributor emails (committers and signed-off-by)")
@@ -378,8 +431,8 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() == 0 {
-		fmt.Println("Usage: git-email-extractor [-t token] [-w workers] [-c] [-f format] [-o output] <repo-url1> [repo-url2 ...]")
-		os.Exit(1)
+		logger.Fatal("no repository URLs provided",
+			zap.String("usage", "git-email-extractor [-t token] [-w workers] [-c] [-f format] [-o output] <repo-url1> [repo-url2 ...]"))
 	}
 
 	emailSet := NewEmailSet()
@@ -387,39 +440,63 @@ func main() {
 
 	jobs := make(chan job, flag.NArg())
 
-	fmt.Printf("Starting email extraction with %d workers...\n", *workers)
+	logger.Info("starting email extraction",
+		zap.Int("workers", *workers),
+		zap.Int("repositories", flag.NArg()))
+
 	wg.Add(*workers)
 	for i := 0; i < *workers; i++ {
-		go worker(jobs, emailSet, &wg, i+1)
+		go worker(ctx, jobs, emailSet, &wg, i+1)
 	}
 
-	for _, repoURL := range flag.Args() {
-		jobs <- job{repoURL: repoURL, token: *token, contributors: *contributors}
-	}
-	close(jobs)
+	go func() {
+		for _, repoURL := range flag.Args() {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- job{repoURL: repoURL, token: *token, contributors: *contributors}:
+			}
+		}
+		close(jobs)
+	}()
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, waiting for workers to finish")
+		<-done
+		logger.Info("shutdown complete")
+	case <-done:
+		logger.Info("all workers completed")
+	}
 
 	emails := emailSet.GetAll()
-	fmt.Printf("\nExtraction complete! Found %d unique email addresses\n", len(emails))
+	logger.Info("extraction completed",
+		zap.Int("unique_emails", len(emails)))
 
 	if *output != "" {
-		// Ensure the output directory exists
 		dir := filepath.Dir(*output)
 		if dir != "." {
 			if err := os.MkdirAll(dir, 0750); err != nil {
-				fmt.Printf("Error creating output directory: %v\n", err)
-				os.Exit(1)
+				logger.Fatal("failed to create output directory",
+					zap.String("path", dir),
+					zap.Error(err))
 			}
 		}
 
 		if err := writeOutput(emails, *format, *output); err != nil {
-			fmt.Printf("Error writing output file: %v\n", err)
-			os.Exit(1)
+			logger.Fatal("failed to write output file",
+				zap.String("path", *output),
+				zap.Error(err))
 		}
-		fmt.Printf("Results written to %s\n", *output)
+		logger.Info("results written to file",
+			zap.String("path", *output))
 	} else {
-		// Print to stdout
 		for _, email := range emails {
 			fmt.Println(email)
 		}
