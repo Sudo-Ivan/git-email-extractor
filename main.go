@@ -1,6 +1,25 @@
 // Copyright (c) 2025 Sudo-Ivan
 // Licensed under the MIT License
 
+// Package main implements a tool to extract unique email addresses from Git repositories.
+// It supports multiple repository URLs, concurrent processing, and various output formats.
+// The tool can extract emails from commit authors, committers, and commit messages.
+//
+// Usage:
+//
+//	git-email-extractor [-t token] [-w workers] [-c] [-f format] [-o output] <repo-url1> [repo-url2 ...]
+//
+// Flags:
+//
+//	-t string
+//	      GitHub/GitLab token for private repositories
+//	-w int
+//	      Number of worker goroutines (default 4)
+//	-c    Include contributor emails (committers and signed-off-by)
+//	-f string
+//	      Output format (json, csv, txt) (default "txt")
+//	-o string
+//	      Output file (default: stdout)
 package main
 
 import (
@@ -35,12 +54,15 @@ func init() {
 }
 
 // EmailSet is a thread-safe set for storing unique email addresses.
+// It provides methods to add and retrieve email addresses while ensuring
+// thread safety through mutex locks.
 type EmailSet struct {
 	mu     sync.Mutex
 	emails map[string]struct{}
 }
 
 // NewEmailSet creates and returns a new EmailSet with a pre-allocated capacity.
+// The initial capacity is set to 1000 to reduce reallocations for large repositories.
 func NewEmailSet() *EmailSet {
 	return &EmailSet{
 		emails: make(map[string]struct{}, 1000),
@@ -48,6 +70,7 @@ func NewEmailSet() *EmailSet {
 }
 
 // Add adds an email address to the EmailSet.
+// The email is converted to lowercase before storage to ensure uniqueness.
 func (e *EmailSet) Add(email string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -55,6 +78,7 @@ func (e *EmailSet) Add(email string) {
 }
 
 // GetAll returns a slice containing all email addresses in the EmailSet.
+// The returned slice is a copy of the internal data structure.
 func (e *EmailSet) GetAll() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
