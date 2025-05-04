@@ -8,6 +8,14 @@ You can find built binaries for mostly every platform in the [Releases](https://
 
 ## Usage
 
+| Platform | Architecture | Status     | Notes                 |
+|----------|--------------|------------|-----------------------|
+| Linux    | amd64        | ✅ Tested  | Works as expected     |
+| Linux    | arm64        | ❌ Untested|                       |
+| Linux    | armv6        | ❌ Untested| Raspberry Pi Zero W   |
+| Windows  | amd64        | ❌ Untested|                       |
+| macOS    | amd64        | ❌ Untested|                       |
+
 ### Using Go
 ```bash
 go install github.com/Sudo-Ivan/Git-Email-Extractor@latest
