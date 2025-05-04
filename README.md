@@ -1,5 +1,7 @@
 # Git Email Extractor
 
+[![Socket Badge](https://socket.dev/api/badge/go/package/github.com/Sudo-Ivan/Git-Email-Extractor?version=v1.1.1)](https://socket.dev/go/package/github.com/Sudo-Ivan/Git-Email-Extractor?version=v1.1.1)
+
 A tool to extract email addresses from any git repository. Only dependency is Git on your system. It can process multiple repositories in parallel.
 
 You can find built binaries for mostly every platform in the [Releases](https://github.com/Sudo-Ivan/Git-Email-Extractor/releases) page. Binaries are built using Github Actions.
