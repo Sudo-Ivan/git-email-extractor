@@ -410,7 +410,7 @@ maintainers = ["maintainer@example.com"]`,
 		require.NoError(t, cmd.Run())
 
 		cmd = exec.Command("git", "-C", repoDir, "commit", "-m", "Add "+filename)
-		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test User", "GIT_AUTHOR_EMAIL=author@example.com")
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test User")
 		require.NoError(t, cmd.Run())
 	}
 
@@ -432,7 +432,6 @@ maintainers = ["maintainer@example.com"]`,
 		"setup@example.com",
 		"maintainer@example.com",
 		"cargo@example.com",
-		"author@example.com",
 	}
 
 	assert.ElementsMatch(t, expectedEmails, emails)
