@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	git-email-extractor [-t token] [-w workers] [-c] [-f format] [-o output] <repo-url1> [repo-url2 ...]
+//	git-email-extractor [-t token] [-w workers] [-c] [-f format] [-o output] [-config config-file] <repo-url1> [repo-url2 ...]
 //
 // Flags:
 //
@@ -20,6 +20,8 @@
 //	      Output format (json, csv, txt) (default "txt")
 //	-o string
 //	      Output file (default: stdout)
+//	-config string
+//	      Path to config file containing list of files to scan
 package main
 
 import (
@@ -247,6 +249,44 @@ func worker(ctx context.Context, jobs <-chan job, emailSet *EmailSet, wg *sync.W
 	}
 }
 
+// scanFileInHistory scans a specific file in git history for email patterns.
+func scanFileInHistory(ctx context.Context, cloneDir string, filename string, emailSet *EmailSet, workerID int) {
+	cmd := exec.CommandContext(ctx, "git", "--no-pager", "log", "--all", "--pretty=format:%H", "--", filename)
+	cmd.Dir = cloneDir
+	output, err := cmd.Output()
+	if err != nil {
+		logger.Debug("file not found in history",
+			zap.Int("worker", workerID),
+			zap.String("file", filename),
+			zap.Error(err))
+		return
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		commit := scanner.Text()
+		if commit == "" {
+			continue
+		}
+
+		cmd = exec.CommandContext(ctx, "git", "--no-pager", "show", commit+":"+filename)
+		cmd.Dir = cloneDir
+		fileContent, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+
+		count := extractEmailsFromOutput(string(fileContent), emailSet)
+		if count > 0 {
+			logger.Info("emails found in file",
+				zap.Int("worker", workerID),
+				zap.String("file", filename),
+				zap.String("commit", commit),
+				zap.Int("count", count))
+		}
+	}
+}
+
 // extractEmails clones a repository, extracts email addresses from the git log, and adds them to the EmailSet.
 func extractEmails(ctx context.Context, repoURL string, token string, emailSet *EmailSet, includeContributors bool, workerID int) {
 	startTime := time.Now()
@@ -295,7 +335,7 @@ func extractEmails(ctx context.Context, repoURL string, token string, emailSet *
 			if strings.Contains(line, "Cloning into") {
 				continue
 			}
-			logger.Info("clone progress",
+			logger.Debug("clone progress",
 				zap.Int("worker", workerID),
 				zap.String("message", line))
 		}
@@ -306,8 +346,19 @@ func extractEmails(ctx context.Context, repoURL string, token string, emailSet *
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if !strings.Contains(line, "Cloning into") {
+			if strings.Contains(line, "Cloning into") {
+				continue
+			}
+			// Only log as error if it's not a progress message
+			if !strings.Contains(line, "remote:") ||
+				(!strings.Contains(line, "Counting objects:") &&
+					!strings.Contains(line, "Compressing objects:") &&
+					!strings.Contains(line, "Enumerating objects:")) {
 				logger.Error("clone error",
+					zap.Int("worker", workerID),
+					zap.String("message", line))
+			} else {
+				logger.Debug("clone progress",
 					zap.Int("worker", workerID),
 					zap.String("message", line))
 			}
@@ -431,11 +482,100 @@ func extractEmails(ctx context.Context, repoURL string, token string, emailSet *
 		}
 	}
 
+	// Scan for emails in common dependency and configuration files
+	configFiles := []string{
+		"pyproject.toml",
+		"setup.py",
+		"setup.cfg",
+		"Cargo.toml",
+		"package.json",
+		"composer.json",
+		"Gemfile",
+		"go.mod",
+		"pom.xml",
+		"build.gradle",
+		"requirements.txt",
+		"Pipfile",
+		"poetry.lock",
+		"package-lock.json",
+		"yarn.lock",
+		".npmrc",
+		".gitconfig",
+		".gitignore",
+		".env",
+		".env.example",
+		"README.md",
+		"CONTRIBUTING.md",
+		"AUTHORS",
+		"CHANGELOG.md",
+	}
+
+	for _, file := range configFiles {
+		scanFileInHistory(ctx, cloneDir, file, emailSet, workerID)
+	}
+
 	duration := time.Since(startTime)
 	logger.Info("repository processing completed",
 		zap.Int("worker", workerID),
 		zap.String("repo", repoURL),
 		zap.Duration("duration", duration))
+}
+
+// loadConfigFiles loads the list of files to scan from a config file.
+func loadConfigFiles(configPath string) ([]string, error) {
+	if configPath == "" {
+		// Default files to scan if no config file is provided
+		return []string{
+			"pyproject.toml",
+			"setup.py",
+			"setup.cfg",
+			"Cargo.toml",
+			"package.json",
+			"composer.json",
+			"Gemfile",
+			"go.mod",
+			"pom.xml",
+			"build.gradle",
+			"requirements.txt",
+			"Pipfile",
+			"poetry.lock",
+			"package-lock.json",
+			"yarn.lock",
+			".npmrc",
+			".gitconfig",
+			".gitignore",
+			".env",
+			".env.example",
+			"README.md",
+			"CONTRIBUTING.md",
+			"AUTHORS",
+			"CHANGELOG.md",
+		}, nil
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %v", err)
+	}
+
+	var files []string
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			files = append(files, line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading config file: %v", err)
+	}
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no files specified in config file")
+	}
+
+	return files, nil
 }
 
 // main is the entry point of the program.
@@ -452,11 +592,18 @@ func main() {
 	contributors := flag.Bool("c", false, "Include contributor emails (committers and signed-off-by)")
 	format := flag.String("f", "txt", "Output format (json, csv, txt)")
 	output := flag.String("o", "", "Output file (default: stdout)")
+	configFile := flag.String("config", "", "Path to config file containing list of files to scan")
 	flag.Parse()
 
 	if flag.NArg() == 0 {
 		logger.Fatal("no repository URLs provided",
-			zap.String("usage", "git-email-extractor [-t token] [-w workers] [-c] [-f format] [-o output] <repo-url1> [repo-url2 ...]"))
+			zap.String("usage", "git-email-extractor [-t token] [-w workers] [-c] [-f format] [-o output] [-config config-file] <repo-url1> [repo-url2 ...]"))
+	}
+
+	configFiles, err := loadConfigFiles(*configFile)
+	if err != nil {
+		logger.Fatal("failed to load config files",
+			zap.Error(err))
 	}
 
 	emailSet := NewEmailSet()
@@ -466,7 +613,8 @@ func main() {
 
 	logger.Info("starting email extraction",
 		zap.Int("workers", *workers),
-		zap.Int("repositories", flag.NArg()))
+		zap.Int("repositories", flag.NArg()),
+		zap.Int("config_files", len(configFiles)))
 
 	wg.Add(*workers)
 	for i := 0; i < *workers; i++ {

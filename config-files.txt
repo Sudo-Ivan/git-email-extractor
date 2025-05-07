@@ -1,0 +1,53 @@
+# Common configuration and dependency files to scan for email addresses
+# Lines starting with # are comments and will be ignored
+# One file path per line
+
+# Python
+pyproject.toml
+setup.py
+setup.cfg
+requirements.txt
+Pipfile
+poetry.lock
+
+# Rust
+Cargo.toml
+
+# Node.js
+package.json
+package-lock.json
+yarn.lock
+.npmrc
+
+# PHP
+composer.json
+
+# Ruby
+Gemfile
+
+# Go
+go.mod
+
+# Java
+pom.xml
+build.gradle
+
+# Git
+.gitconfig
+.gitignore
+
+# Environment
+.env
+.env.example
+
+# Documentation
+README.md
+CONTRIBUTING.md
+AUTHORS
+CHANGELOG.md
+
+# Additional common files
+LICENSE
+MAINTAINERS
+CODE_OF_CONDUCT.md
+SECURITY.md 

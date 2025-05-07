@@ -5,7 +5,10 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"testing"
@@ -305,4 +308,132 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
+}
+
+func BenchmarkEmailExtraction(b *testing.B) {
+	// Stop any existing CPU profile
+	pprof.StopCPUProfile()
+
+	// Create CPU profile
+	cpuProfile, err := os.Create("cpu.prof")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		pprof.StopCPUProfile()
+		cpuProfile.Close()
+	}()
+
+	if err := pprof.StartCPUProfile(cpuProfile); err != nil {
+		b.Fatal(err)
+	}
+
+	// Create memory profile
+	memProfile, err := os.Create("mem.prof")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		pprof.WriteHeapProfile(memProfile)
+		memProfile.Close()
+	}()
+
+	// Test data with more realistic content
+	testInput := `Contact us at test1@example.com or support@example.com for help.
+	Additional emails: dev@example.com, test+label@example.com, Test@Example.com
+	Please reach out to team@company.com or sales@company.com
+	For support: help@support.com, support@help.com
+	Development team: dev@team.com, engineer@team.com
+	Marketing: marketing@company.com, press@company.com`
+
+	// Force GC before starting
+	runtime.GC()
+
+	// Reset timer and run benchmark
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		emailSet := NewEmailSet()
+		extractEmailsFromOutput(testInput, emailSet)
+		// Get the results to prevent compiler optimization
+		_ = emailSet.GetAll()
+	}
+	b.StopTimer()
+
+	// Force GC before reading stats
+	runtime.GC()
+
+	// Print memory stats
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// Report metrics in bytes for most precise measurements
+	b.ReportMetric(float64(m.Alloc), "B/op")
+	b.ReportMetric(float64(m.TotalAlloc), "B/total")
+	b.ReportMetric(float64(m.NumGC), "GC/op")
+	b.ReportMetric(float64(m.PauseTotalNs)/1e6, "ms/GC")
+}
+
+func TestScanFileInHistory(t *testing.T) {
+	// Create a temporary directory for the test repository
+	tempDir := t.TempDir()
+	repoDir := filepath.Join(tempDir, "test-repo")
+
+	// Initialize git repository
+	cmd := exec.Command("git", "init", repoDir)
+	require.NoError(t, cmd.Run())
+
+	// Create test files with email addresses
+	testFiles := map[string]string{
+		"pyproject.toml": `[project]
+authors = [
+    {name = "Test User", email = "test@example.com"},
+    {name = "Another User", email = "another@example.com"}
+]`,
+		"setup.py": `setup(
+    author="Test User",
+    author_email="setup@example.com",
+    maintainer="Maintainer",
+    maintainer_email="maintainer@example.com"
+)`,
+		"Cargo.toml": `[package]
+authors = ["cargo@example.com"]
+maintainers = ["maintainer@example.com"]`,
+	}
+
+	// Create and commit test files
+	for filename, content := range testFiles {
+		filePath := filepath.Join(repoDir, filename)
+		err := os.WriteFile(filePath, []byte(content), 0644)
+		require.NoError(t, err)
+
+		cmd = exec.Command("git", "-C", repoDir, "add", filename)
+		require.NoError(t, cmd.Run())
+
+		cmd = exec.Command("git", "-C", repoDir, "commit", "-m", "Add "+filename)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test User", "GIT_AUTHOR_EMAIL=author@example.com")
+		require.NoError(t, cmd.Run())
+	}
+
+	// Test scanning files
+	emailSet := NewEmailSet()
+	ctx := context.Background()
+
+	for filename := range testFiles {
+		t.Run(filename, func(t *testing.T) {
+			scanFileInHistory(ctx, repoDir, filename, emailSet, 1)
+		})
+	}
+
+	// Verify extracted emails
+	emails := emailSet.GetAll()
+	expectedEmails := []string{
+		"test@example.com",
+		"another@example.com",
+		"setup@example.com",
+		"maintainer@example.com",
+		"cargo@example.com",
+		"author@example.com",
+	}
+
+	assert.ElementsMatch(t, expectedEmails, emails)
 }
