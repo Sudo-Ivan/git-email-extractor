@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -59,7 +60,7 @@ func TestEmailSet(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			emailSet := NewEmailSet()
+			emailSet := NewOptimizedEmailSet(nil)
 			for _, email := range tt.emails {
 				emailSet.Add(email)
 			}
@@ -121,9 +122,8 @@ func TestExtractEmailsFromOutput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			emailSet := NewEmailSet()
-			count := extractEmailsFromOutput(tt.input, emailSet)
-			assert.Equal(t, len(tt.expected), count)
+			emailSet := NewOptimizedEmailSet(nil)
+			extractEmailsFromOutput(tt.input, emailSet)
 
 			emails := emailSet.GetAll()
 			actualEmails := make([]string, len(emails))
@@ -139,96 +139,126 @@ func TestExtractEmailsFromOutput(t *testing.T) {
 	}
 }
 
-func TestWriteOutput(t *testing.T) {
-	emails := []string{"test1@example.com", "test2@example.com"}
+func TestOutputWriterProcess(t *testing.T) {
+	testEmails := []string{"test1@example.com", "test2@example.com", "test3@example.com"}
 	tempDir := t.TempDir()
 
 	tests := []struct {
-		name     string
-		format   string
-		filename string
-		validate func(t *testing.T, path string)
-		wantErr  bool
+		name           string
+		format         string
+		filename       string
+		expectedOutput func(t *testing.T, path string, originalEmails []string)
+		wantErrInSetup bool // If true, expects an error during setup (e.g. bad path)
 	}{
 		{
-			name:     "write json",
+			name:     "write json lines",
 			format:   "json",
-			filename: "output.json",
-			validate: func(t *testing.T, path string) {
-				data, err := os.ReadFile(path)
+			filename: "output.jsonl",
+			expectedOutput: func(t *testing.T, path string, originalEmails []string) {
+				file, err := os.Open(path) // #nosec G304 -- Test file
 				require.NoError(t, err)
+				defer file.Close() // #nosec G307 -- Test file
 
-				var result struct {
-					Count  int      `json:"count"`
-					Emails []string `json:"emails"`
+				var foundEmails []string
+				scanner := bufio.NewScanner(file)
+				for scanner.Scan() {
+					var result struct {
+						Email string `json:"email"`
+					}
+					err = json.Unmarshal(scanner.Bytes(), &result)
+					require.NoError(t, err, "Failed to unmarshal: %s", scanner.Text())
+					foundEmails = append(foundEmails, result.Email)
 				}
-				err = json.Unmarshal(data, &result)
-				require.NoError(t, err)
-
-				assert.Equal(t, len(emails), result.Count)
-				assert.ElementsMatch(t, emails, result.Emails)
+				require.NoError(t, scanner.Err())
+				assert.ElementsMatch(t, originalEmails, foundEmails)
 			},
-			wantErr: false,
 		},
 		{
 			name:     "write csv",
 			format:   "csv",
 			filename: "output.csv",
-			validate: func(t *testing.T, path string) {
-				file, err := os.Open(path)
+			expectedOutput: func(t *testing.T, path string, originalEmails []string) {
+				file, err := os.Open(path) // #nosec G304 -- Test file
 				require.NoError(t, err)
-				defer file.Close()
+				defer file.Close() // #nosec G307 -- Test file
 
 				reader := csv.NewReader(file)
 				records, err := reader.ReadAll()
 				require.NoError(t, err)
 
-				assert.Equal(t, len(emails)+1, len(records))
+				require.GreaterOrEqual(t, len(records), 1, "CSV should have at least a header")
 				assert.Equal(t, []string{"email"}, records[0])
 
 				var foundEmails []string
-				for _, record := range records[1:] {
-					foundEmails = append(foundEmails, record[0])
+				if len(records) > 1 {
+					for _, record := range records[1:] {
+						foundEmails = append(foundEmails, record[0])
+					}
 				}
-				assert.ElementsMatch(t, emails, foundEmails)
+				assert.ElementsMatch(t, originalEmails, foundEmails)
 			},
-			wantErr: false,
 		},
 		{
 			name:     "write txt",
 			format:   "txt",
 			filename: "output.txt",
-			validate: func(t *testing.T, path string) {
-				data, err := os.ReadFile(path)
+			expectedOutput: func(t *testing.T, path string, originalEmails []string) {
+				data, err := os.ReadFile(path) // #nosec G304 -- Test file
 				require.NoError(t, err)
 
-				foundEmails := strings.Split(strings.TrimSpace(string(data)), "\n")
-				assert.ElementsMatch(t, emails, foundEmails)
+				var foundEmails []string
+				trimmedData := strings.TrimSpace(string(data))
+				if trimmedData != "" {
+					foundEmails = strings.Split(trimmedData, "\n")
+				}
+				assert.ElementsMatch(t, originalEmails, foundEmails)
 			},
-			wantErr: false,
 		},
 		{
-			name:     "invalid format",
-			format:   "invalid",
-			filename: "output.invalid",
-			validate: nil,
-			wantErr:  true,
+			name:     "unsupported format handled by main but writer should be robust",
+			format:   "xml", // main func validates this, but writer has default case
+			filename: "output.xml",
+			expectedOutput: func(t *testing.T, path string, originalEmails []string) {
+				// Expect an empty file or just a header if applicable, as data writing would fail or be skipped.
+				// For this test, we mainly ensure it doesn't panic and completes.
+				// The actual error logging for unsupported format is in outputWriterProcess.
+				// We might check that the file is empty if created.
+				info, err := os.Stat(path)
+				if os.IsNotExist(err) { // File might not be created if format is truly unknown early
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, int64(0), info.Size(), "File for unsupported format should be empty or not exist")
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			outputPath := filepath.Join(tempDir, tt.filename)
-			err := writeOutput(emails, tt.format, outputPath)
-			if tt.wantErr {
-				assert.Error(t, err)
-				return
+			if tt.format == "xml" { // Special handling for xml to simulate passing invalid format to writer
+				logger = zaptest.NewLogger(t) // Capture logs for this specific subtest
 			}
-			require.NoError(t, err)
-			assert.FileExists(t, outputPath)
 
-			if tt.validate != nil {
-				tt.validate(t, outputPath)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			emailChannel := make(chan string, len(testEmails)+1)
+			var writerWg sync.WaitGroup
+			var writtenEmailCount int64
+
+			writerWg.Add(1)
+			go outputWriterProcess(ctx, outputPath, tt.format, emailChannel, &writerWg, &writtenEmailCount)
+
+			for _, email := range testEmails {
+				emailChannel <- email
+			}
+			close(emailChannel)
+
+			writerWg.Wait()
+
+			if tt.expectedOutput != nil {
+				tt.expectedOutput(t, outputPath, testEmails)
 			}
 		})
 	}
@@ -288,7 +318,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 
 	jobs := make(chan job, 1)
 	var wg sync.WaitGroup
-	emailSet := NewEmailSet()
+	emailSet := NewOptimizedEmailSet(nil)
 
 	wg.Add(1)
 	go worker(ctx, jobs, emailSet, &wg, 1)
@@ -352,7 +382,7 @@ func BenchmarkEmailExtraction(b *testing.B) {
 	// Reset timer and run benchmark
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		emailSet := NewEmailSet()
+		emailSet := NewOptimizedEmailSet(nil)
 		extractEmailsFromOutput(testInput, emailSet)
 		// Get the results to prevent compiler optimization
 		_ = emailSet.GetAll()
@@ -415,7 +445,7 @@ maintainers = ["maintainer@example.com"]`,
 	}
 
 	// Test scanning files
-	emailSet := NewEmailSet()
+	emailSet := NewOptimizedEmailSet(nil)
 	ctx := context.Background()
 
 	for filename := range testFiles {
